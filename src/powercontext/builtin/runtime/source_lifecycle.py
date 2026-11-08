@@ -91,7 +91,18 @@ class SourceLifecycleEvent(BaseModel):
 
 
 class _Node:
-    __slots__ = ("node_id", "family", "reference", "parents", "policy", "revision", "available", "last_sequence")
+    __slots__ = (
+        "node_id",
+        "family",
+        "reference",
+        "parents",
+        "policy",
+        "revision",
+        "available",
+        "last_sequence",
+        "last_reason",
+        "entry_active",
+    )
 
     def __init__(
         self,
@@ -104,6 +115,8 @@ class _Node:
         revision: int,
         available: bool,
         last_sequence: int = 0,
+        last_reason: str | None = None,
+        entry_active: bool | None = None,
     ) -> None:
         self.node_id = node_id
         self.family = family
@@ -113,6 +126,8 @@ class _Node:
         self.revision = revision
         self.available = available
         self.last_sequence = last_sequence
+        self.last_reason = last_reason
+        self.entry_active = available if entry_active is None else entry_active
 
     def matches(self, other: _Node) -> bool:
         return (
@@ -131,6 +146,8 @@ class _Node:
             "revision": self.revision,
             "available": self.available,
             "last_sequence": self.last_sequence,
+            "last_reason": self.last_reason,
+            "entry_active": self.entry_active,
         }
         if self.policy is not None:
             record["policy"] = self.policy
@@ -159,6 +176,8 @@ def _node_from_json(payload: dict) -> _Node:
         revision=int(payload["revision"]),
         available=bool(payload["available"]),
         last_sequence=int(payload.get("last_sequence", 0)),
+        last_reason=payload.get("last_reason"),
+        entry_active=None if payload.get("entry_active") is None else bool(payload["entry_active"]),
     )
 
 
@@ -311,18 +330,22 @@ class ScopedSourceLifecycle:
         node = nodes.get(event.node_id)
         if node is None:
             raise SourceLifecycleError(f"unknown node {event.node_id!r}")  # noqa: TRY003
+        if node.family != "source":
+            raise SourceLifecycleError("lifecycle events only apply to registered Sources")  # noqa: TRY003
         if event.revision != node.revision:
             raise SourceLifecycleError("event revision does not match the registered node")  # noqa: TRY003
         if event.sequence < node.last_sequence:
             raise SourceLifecycleError("event sequence must not decrease")  # noqa: TRY003
         if event.sequence == node.last_sequence:
-            if event.available != node.available:
-                raise SourceLifecycleError("a replayed sequence cannot change availability")  # noqa: TRY003
-            return sorted(entry.node_id for entry in nodes.values() if entry.available)
-        node.available = event.available
-        node.last_sequence = event.sequence
+            same_availability = event.available == node.available
+            same_reason = node.last_reason is None or node.last_reason == event.reason
+            if not (same_availability and same_reason):
+                raise SourceLifecycleError("a replayed sequence cannot change the recorded event")  # noqa: TRY003
+        else:
+            node.available = event.available
+            node.last_sequence = event.sequence
+            node.last_reason = event.reason
 
-        changed = {node.node_id: node.available}
         settled = False
         while not settled:
             settled = True
@@ -332,19 +355,21 @@ class ScopedSourceLifecycle:
                 updated = self._derived_availability(candidate, nodes)
                 if updated != candidate.available:
                     candidate.available = updated
-                    changed[candidate.node_id] = updated
                     settled = False
 
-        for node_id, available in changed.items():
-            entry = nodes[node_id]
-            if entry.family == "memory":
-                await self._set_memory_entry(entry, available=available)
+        # Retry-safe effect application: every entry whose durable activity lags
+        # behind the propagated availability is synced before anything is persisted,
+        # so an interrupted apply completes on the replay of the same event.
+        for candidate in nodes.values():
+            if candidate.family == "memory" and candidate.entry_active != candidate.available:
+                await self._set_memory_entry(candidate, available=candidate.available)
         await self._persist()
         return sorted(entry.node_id for entry in nodes.values() if entry.available)
 
     async def _set_memory_entry(self, node: _Node, *, available: bool) -> None:
         application = self._runtime.memory.for_scope(self.scope_id)
         await application._set_entry_activity(node.reference, available=available)  # noqa: SLF001 - runtime seam.
+        node.entry_active = available
 
     async def resolve(self, node_id: str, /, *, purpose: str):
         nodes = await self._load()

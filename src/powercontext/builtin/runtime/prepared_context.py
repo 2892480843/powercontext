@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from itertools import chain
@@ -106,6 +107,17 @@ class PreparedContextBuild:
     origins: tuple[PreparedContextOrigin, ...]
     omissions: PreparedContextOmissions = PreparedContextOmissions()
     code_origins: tuple[CodeEvidenceRef, ...] = ()
+    fragments: tuple[PreparedContextFragment, ...] = ()
+
+
+@dataclass(frozen=True)
+class PreparedContextFragment:
+    """One exact original-text slice selected from a Memory entry."""
+
+    address: MemoryEntryAddress
+    start: int
+    end: int
+    text: str
 
 
 @dataclass(frozen=True)
@@ -235,6 +247,8 @@ class PreparedContextBuilder:
         if sum(len(candidates.hits) for candidates in experience_candidates) > self.experience_candidate_limit:
             raise PreparedContextInvariantError("experience-candidate-limit")
 
+        if request.evidence_selection and request.assembly is None:
+            return self._build_evidence_fragments(request, current_scope_id, memory_candidates)
         content, origins, omissions = self._select_entries(
             request=request,
             current_scope_id=current_scope_id,
@@ -292,6 +306,66 @@ class PreparedContextBuilder:
             truncated_items=omissions.truncated_items,
             dropped_items=omissions.dropped_items,
             unused_bytes=max(0, request.max_bytes - content_bytes),
+        )
+
+    def _build_evidence_fragments(
+        self,
+        request: PrepareContextRequest,
+        current_scope_id: str | None,
+        memory_candidates: Sequence[PreparedMemoryCandidates],
+    ) -> PreparedContextBuild:
+        """Select query-relevant literal slices of Memory entries within the budget."""
+
+        terms = _query_terms(request.query)
+        picked: list[_FragmentChoice] = []
+        for candidates in memory_candidates:
+            scope_id = None if candidates.scope_id == current_scope_id else candidates.scope_id or None
+            for hit in candidates.hits:
+                if not hit.text.strip() or not hit.entry_id.strip():
+                    continue
+                address = MemoryEntryAddress(
+                    memory=ArtifactAddress(scope_id=scope_id or current_scope_id or "", artifact=hit.memory_ref),
+                    entry_id=hit.entry_id,
+                    entry_version_id=hit.entry_version_id,
+                )
+                for span, score in _ranked_spans(hit.text, terms):
+                    choice = _FragmentChoice(
+                        address=address,
+                        start=span[0],
+                        end=span[1],
+                        text=hit.text[span[0] : span[1]],
+                        score=score,
+                    )
+                    if any(
+                        existing.address == choice.address
+                        and not (choice.end <= existing.start or existing.end <= choice.start)
+                        for existing in picked
+                    ):
+                        continue
+                    if _fragment_render_bytes([*picked, choice]) > request.max_bytes:
+                        continue
+                    picked.append(choice)
+        if not picked:
+            return PreparedContextBuild(context=self.empty(), origins=(), fragments=())
+        origins: list[PreparedContextOrigin] = []
+        for choice in picked:
+            if current_scope_id is None or choice.address.memory.scope_id == current_scope_id:
+                origins.append(
+                    MemoryCitation(
+                        memory_ref=choice.address.memory.artifact,
+                        entry_id=choice.address.entry_id,
+                        entry_version_id=choice.address.entry_version_id,
+                    )
+                )
+            else:
+                origins.append(choice.address)
+        return PreparedContextBuild(
+            context=_render_fragments(picked),
+            origins=tuple(origins),
+            fragments=tuple(
+                PreparedContextFragment(address=choice.address, start=choice.start, end=choice.end, text=choice.text)
+                for choice in picked
+            ),
         )
 
     def _select_entries(
@@ -658,6 +732,72 @@ class PreparedContextBuilder:
         if best is None:
             return _EntryFit(dropped_no_fitting_truncation=True)
         return _EntryFit(entry=best)
+
+
+@dataclass(frozen=True)
+class _FragmentChoice:
+    """One candidate literal slice with its relevance score."""
+
+    address: MemoryEntryAddress
+    start: int
+    end: int
+    text: str
+    score: int
+
+
+def _query_terms(query: str) -> tuple[str, ...]:
+    """Split one query into casefolded word terms, keeping CJK runs."""
+
+    terms = re.findall(r"\w+", query.casefold())
+    return tuple(term for term in dict.fromkeys(terms) if len(term) >= 2 or not term.isascii())
+
+
+def _ranked_spans(text: str, terms: tuple[str, ...]) -> tuple[tuple[tuple[int, int], int], ...]:
+    """Score sentence-like spans by distinct query terms they contain."""
+
+    spans: list[tuple[tuple[int, int], int]] = []
+    for match in re.finditer(r"[^.\n]+(?:[.!?]|$)", text):
+        start, end = match.span()
+        while start < end and text[start].isspace():
+            start += 1
+        while end > start and text[end - 1].isspace():
+            end -= 1
+        if start >= end:
+            continue
+        lowered = text[start:end].casefold()
+        score = sum(1 for term in terms if term in lowered)
+        if score > 0:
+            spans.append(((start, end), score))
+    spans.sort(key=lambda item: (-item[1], item[0][0]))
+    return tuple(spans)
+
+
+def _fragment_items(choices: Sequence[_FragmentChoice]) -> list[dict[str, object]]:
+    return [
+        {
+            "citation": {
+                "scope_id": choice.address.memory.scope_id,
+                "memory_ref": choice.address.memory.artifact.model_dump(mode="json"),
+                "entry_id": choice.address.entry_id,
+                "entry_version_id": choice.address.entry_version_id,
+            },
+            "content": choice.text,
+            "start": choice.start,
+            "end": choice.end,
+        }
+        for choice in choices
+    ]
+
+
+def _render_fragments(choices: Sequence[_FragmentChoice]) -> PreparedContext:
+    envelope = {"trust": "untrusted_history", "items": _fragment_items(choices)}
+    encoded = json.dumps(envelope, ensure_ascii=False, separators=(",", ":"))
+    content = "\n\n".join((TRUST_POLICY, f"{_BEGIN_MARKER}\n{encoded}\n{_END_MARKER}"))
+    return PreparedContext(status="ready", content=content, content_bytes=len(content.encode("utf-8")))
+
+
+def _fragment_render_bytes(choices: Sequence[_FragmentChoice]) -> int:
+    return len(_render_fragments(choices).content.encode("utf-8"))
 
 
 def _interleave(

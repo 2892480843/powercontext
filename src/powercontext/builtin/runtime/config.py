@@ -189,6 +189,13 @@ class RuntimeConfig(BaseModel):
         CronTrigger.from_crontab(self.profile_cron, timezone=timezone)
         return self
 
+    @field_validator("memory_source_count_threshold", "topic_memory_source_count_threshold", mode="before")
+    @classmethod
+    def validate_strict_positive_threshold(cls, value):
+        if value is None or (type(value) is int and value > 0):
+            return value
+        raise ValueError("count thresholds must be strict positive integers or None")  # noqa: TRY003
+
     @model_validator(mode="after")
     def validate_recall_gate_threshold_order(self):
         if not self.recall_gate_enabled:
@@ -200,6 +207,8 @@ class RuntimeConfig(BaseModel):
         return self
 
     schedule_seconds: float | None = Field(default=None, gt=0)
+    memory_source_count_threshold: int | None = Field(default=None, gt=0)
+    topic_memory_source_count_threshold: int | None = Field(default=None, gt=0)
     memory_schedule_seconds: float | None = Field(default=None, gt=0)
     experience_schedule_seconds: float | None = Field(default=None, gt=0)
     dream_enabled: bool = True

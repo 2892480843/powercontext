@@ -28,6 +28,8 @@ from typing import TYPE_CHECKING, Any, Protocol
 
 from pydantic import BaseModel, JsonValue, ValidationError
 
+from sqlalchemy import func, select
+
 from powercontext._logging import log_safely
 from powercontext.artifacts import ArtifactRef
 from powercontext.builtin.artifacts.experience import (
@@ -170,6 +172,10 @@ from powercontext.builtin.runtime.decision_model import DecisionModel
 from powercontext.builtin.runtime.context_pack import ContextPack, ContextPackDelta
 from powercontext.builtin.runtime.errors import InvalidRuntimeRequestError, TopicMemoryProcessingUnavailableError
 from powercontext.builtin.runtime.source_lifecycle import SourceLifecycleApplication
+from powercontext.builtin.persistence.cursors import SourceCursorRepository
+from powercontext.builtin.persistence.tables import SOURCES_TABLE
+from powercontext.builtin.triggers import SOURCE_WINDOW_TRIGGER_NAME
+from powercontext.builtin.artifacts.topic_memory import TOPIC_MEMORY_SOURCE_WINDOW_BINDING
 from powercontext.builtin.runtime.models import (
     ApproveArtifactCandidateRequest,
     CaptureSource,
@@ -490,10 +496,12 @@ class ScopedSourceApplication:
                             span.set_attributes({_MEMORY_CAPTURE_SOURCE_COUNT: 1})
             except BaseValueConflictError as error:
                 raise SourceConflictError("identity", error.identity) from None
-            return SourceReceipt(
+            receipt = SourceReceipt(
                 source_ref=SourceRef(source_type=record.source_type, source_id=record.source_id),
                 sequence=record.position,
             )
+            self._runtime._schedule_count_admission(self.scope_id)
+            return receipt
         async with self._runtime._context(self.scope_id) as context:
             with self._runtime._stage(_MEMORY_CAPTURE_STAGE, attributes={}) as span:
                 source, sequence = await context.sources.capture(
@@ -506,7 +514,9 @@ class ScopedSourceApplication:
                 )
                 if span is not None:
                     span.set_attributes({_MEMORY_CAPTURE_SOURCE_COUNT: 1})
-            return SourceReceipt(source_ref=context.sources.catalog.as_ref(source), sequence=sequence)
+            receipt = SourceReceipt(source_ref=context.sources.catalog.as_ref(source), sequence=sequence)
+            self._runtime._schedule_count_admission(self.scope_id)
+            return receipt
 
 
 class SourceApplication:
@@ -565,7 +575,9 @@ class ScopedRecordApplication:
         /,
     ) -> ArtifactCreated:
         async with self._runtime._scope_operation(self.scope_id), self._runtime._locked(self.scope_id):
-            return await self._runtime._records().create_artifact(self.scope_id, family, write)
+            created = await self._runtime._records().create_artifact(self.scope_id, family, write)
+        self._runtime._schedule_count_admission(self.scope_id)
+        return created
 
     async def get_artifact(self, family: str, artifact_id: str, /) -> ArtifactRecord:
         async with self._runtime._scope_operation(self.scope_id):
@@ -3071,6 +3083,8 @@ class BuiltinRuntime:
         clock: Clock | None = None,
         tracing: RuntimeTracing | None = None,
         scheduled_source_runner: ScheduledSourceRunner | None = None,
+        memory_source_count_threshold: int | None = None,
+        topic_memory_source_count_threshold: int | None = None,
         scheduled_experience_runner: ScheduledExperienceRunner | None = None,
         remote_ingestion: RemoteIngestion | None = None,
         dream_service: DreamService | None = None,
@@ -3140,6 +3154,10 @@ class BuiltinRuntime:
         )
         self._processor_lock = asyncio.Lock()
         self._close_lock = asyncio.Lock()
+        self.memory_source_count_threshold = memory_source_count_threshold
+        self.topic_memory_source_count_threshold = topic_memory_source_count_threshold
+        self._count_admission_tasks: set[asyncio.Task[None]] = set()
+        self._scope_ids = scope_ids
         self._lifecycle = asyncio.Condition()
         self._active_operations = 0
         self._operation_depths: dict[asyncio.Task[Any], int] = {}
@@ -3172,7 +3190,118 @@ class BuiltinRuntime:
             None if scope_ids is None or experience_incubator is None else ScheduledExperienceProcessor(self, scope_ids)
         )
 
+    def _schedule_count_admission(self, scope_id: str) -> None:
+        """Arm one count-based admission check for a scope after a journal write."""
+
+        if self._closing or self._closed:
+            return
+        if self.memory_source_count_threshold is None and self.topic_memory_source_count_threshold is None:
+            return
+        task = asyncio.get_running_loop().create_task(self._run_count_admission(scope_id))
+        self._count_admission_tasks.add(task)
+        task.add_done_callback(self._count_admission_tasks.discard)
+
+    def _schedule_count_admission_sweep(self) -> None:
+        """Re-evaluate persisted pending counts when a Runtime reopens."""
+
+        if self.memory_source_count_threshold is None and self.topic_memory_source_count_threshold is None:
+            return
+        if self._scope_ids is None:
+            return
+        task = asyncio.get_running_loop().create_task(self._count_admission_sweep())
+        self._count_admission_tasks.add(task)
+        task.add_done_callback(self._count_admission_tasks.discard)
+
+    async def _count_admission_sweep(self) -> None:
+        try:
+            for scope_id in await self._scope_ids():
+                if self._closing or self._closed:
+                    return
+                await self._run_count_admission(scope_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:  # noqa: BLE001 - admission sweeps never break startup.
+            log_safely(
+                logger,
+                logging.ERROR,
+                "Count admission sweep failed",
+                exc_info=error,
+                extra={"event": "count_admission.sweep_failed", "outcome": "failure", "unit": "runtime"},
+            )
+
+    async def _count_pending_sources(self, scope_id: str, cursor_name: str) -> int:
+        """Count journal identities after one family cursor."""
+
+        cursor_repository = SourceCursorRepository()
+        async with self._provider.database.transaction() as connection:
+                stored = await cursor_repository.load(connection, scope_id, cursor_name)
+                cursor = 0 if stored is None else stored.cursor.sequence
+                watermark = await connection.execute(
+                    select(func.coalesce(func.max(SOURCES_TABLE.c.journal_position), 0)).where(
+                        SOURCES_TABLE.c.scope_id == scope_id
+                    )
+                )
+                high = watermark.scalar_one()
+        return int(high) - int(cursor)
+
+    async def _run_count_admission(self, scope_id: str) -> None:
+        """Run the ordinary processing call once when a count threshold is reached."""
+
+        if self._closing or self._closed:
+            return
+        async with self._processor_lock:
+            try:
+                if (
+                    self.memory_source_count_threshold is not None
+                    and await self._count_pending_sources(scope_id, SOURCE_WINDOW_TRIGGER_NAME)
+                    >= self.memory_source_count_threshold
+                ):
+                    runner = self._scheduled_source_runner
+                    if runner is None:
+                        await self.memory.for_scope(scope_id).flush()
+                    else:
+                        await runner(scope_id, self)
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:  # noqa: BLE001 - failed processing keeps its own retry path.
+                log_safely(
+                    logger,
+                    logging.ERROR,
+                    "Memory count admission failed",
+                    exc_info=error,
+                    extra={
+                        "event": "count_admission.memory_failed",
+                        "outcome": "failure",
+                        "unit": "memory",
+                        "powercontext.scope_id": scope_id,
+                    },
+                )
+            try:
+                if (
+                    self.topic_memory_source_count_threshold is not None
+                    and self._topic_memory_flush is not None
+                    and await self._count_pending_sources(scope_id, TOPIC_MEMORY_SOURCE_WINDOW_BINDING)
+                    >= self.topic_memory_source_count_threshold
+                ):
+                    await self.topic_memory.for_scope(scope_id).flush()
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:  # noqa: BLE001 - failed processing keeps its own retry path.
+                log_safely(
+                    logger,
+                    logging.ERROR,
+                    "Topic Memory count admission failed",
+                    exc_info=error,
+                    extra={
+                        "event": "count_admission.topic_memory_failed",
+                        "outcome": "failure",
+                        "unit": "topic-memory",
+                        "powercontext.scope_id": scope_id,
+                    },
+                )
+
     async def __aenter__(self) -> BuiltinRuntime:
+        self._schedule_count_admission_sweep()
         return self
 
     async def __aexit__(self, exc_type: object, exc_value: object, traceback: object) -> None:

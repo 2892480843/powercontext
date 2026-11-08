@@ -169,6 +169,7 @@ from powercontext.builtin.runtime._scope_cache import (
 from powercontext.builtin.runtime.decision_model import DecisionModel
 from powercontext.builtin.runtime.context_pack import ContextPack, ContextPackDelta
 from powercontext.builtin.runtime.errors import InvalidRuntimeRequestError, TopicMemoryProcessingUnavailableError
+from powercontext.builtin.runtime.source_lifecycle import SourceLifecycleApplication
 from powercontext.builtin.runtime.models import (
     ApproveArtifactCandidateRequest,
     CaptureSource,
@@ -2585,6 +2586,27 @@ class ScopedMemoryApplication:
                 entry=_entry_record(updated, retired),
             )
 
+    async def _set_entry_activity(self, citation: MemoryCitation, /, *, available: bool) -> None:
+        """Flip one cited logical entry between active and inactive without new body versions."""
+
+        async with self._runtime._context(
+            self.scope_id,
+            embedding_purpose=ModelUsagePurpose.MEMORY_INDEXING,
+        ) as context:
+            async with self._runtime._locked(self.scope_id):
+                service = context.artifacts.memory
+                current = await _head_or_none(service, context.artifacts.memory_artifact_id)
+                if current is None:
+                    raise _RuntimeStateError("memory-head")
+                entries = {entry.entry_id: entry for entry in await service.entries(current)}
+                entry = entries.get(citation.entry_id)
+                if entry is None:
+                    raise _RuntimeStateError("memory-entry")
+                if available:
+                    await service.reactivate(current, entries=(entry,))
+                else:
+                    await service.forget(current, entries=(entry,))
+
     async def changes(self, *, since_revision: int | None = None) -> MemoryChangesPage:
         async with self._runtime._context(self.scope_id) as context:
             service = context.artifacts.memory
@@ -2683,6 +2705,16 @@ class ScopedTopicMemoryApplication:
                     query_embedding,
                     embedding_timeout_seconds,
                 )
+            inactive_topics = await self._runtime.lifecycle.for_scope(self.scope_id).inactive_topic_keys()
+            if inactive_topics:
+                visible = tuple(
+                    hit
+                    for hit in result.hits
+                    if (hit.artifact_ref.family, hit.artifact_ref.artifact_id, hit.artifact_ref.revision)
+                    not in inactive_topics
+                )
+                if len(visible) != len(result.hits):
+                    result = result.model_copy(update={"hits": visible})
         observer = self._runtime._topic_memory_search_observer
         if observer is not None:
             try:
@@ -3127,6 +3159,7 @@ class BuiltinRuntime:
         self.memory = MemoryApplication(self)
         self.topic_memory = TopicMemoryApplication(self)
         self.records = RecordApplication(self)
+        self.lifecycle = SourceLifecycleApplication(self)
         self.prompts = PromptApplication(self)
         self.review = ReviewApplication(self)
         self.skill = SkillApplication(self)

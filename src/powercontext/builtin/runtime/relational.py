@@ -190,6 +190,7 @@ from powercontext.builtin.runtime.protocols import (
 )
 from powercontext.builtin.runtime.recall import RelationalRecallTokenEstimator
 from powercontext.builtin.runtime.recurrence import RelationalRecurrenceLedger
+from powercontext.builtin.runtime.source_lifecycle import SourceLifecycle, SourceLifecycleManagementWriter
 from powercontext.builtin.runtime.statistics import RelationalScopedStatistics
 from powercontext.builtin.scope import ScopeApplication
 from powercontext.builtin.scope.subject_sources import SubjectSourceService
@@ -556,7 +557,7 @@ class RelationalContexts:
         self.experience_index = NoExperienceIndex() if experience_index is None else experience_index
         source_repository = SourceRepository(self.source_registry)
         artifact_repository = ArtifactRepository(
-            (Handoff, Memory, Experience, Skill, Profile, Prompt, TopicMemory),
+            (Handoff, Memory, Experience, Skill, Profile, Prompt, TopicMemory, SourceLifecycle),
             sources=source_repository,
         )
         topic_memory_repository = TopicMemoryRepository(artifacts=artifact_repository, index=self.topic_memory_index)
@@ -619,6 +620,7 @@ class RelationalContexts:
             usage_reporter=self.model_usage_reporter,
         )
         family_writers = FamilyManagementWriterRegistry((
+            SourceLifecycleManagementWriter(self.repositories.artifacts),
             topic_memory_writer,
             PromptManagementWriter(self.repositories.artifacts, self.prompt_registry),
             ProfileManagementWriter(self.repositories.artifacts),

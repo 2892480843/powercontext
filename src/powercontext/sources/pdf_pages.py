@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import hashlib
+import re
 import io
 from typing import TYPE_CHECKING
 
@@ -160,32 +161,68 @@ PDF_PAGE_SOURCE_DEFINITION = AdapterSourceDefinition(
 )
 
 
+_QUERY_STOPWORDS = frozenset(
+    "a an the and or of in on for to from by with as at is are was were be been being has have had "
+    "this that these those it its any what which who whom whose when where why how much many more most "
+    "less least not no than then so such can could will would shall should may might must do does did "
+    "done about into over under between within also each other some all there their per".split()
+)
+
+
+def _content_terms(query: str) -> tuple[str, ...]:
+    """Keep meaningful query terms: content words, figures, and years."""
+
+    terms = []
+    for word in re.findall(r"[A-Za-z0-9][A-Za-z0-9$%.,'-]*", query):
+        cleaned = word.strip(".,'-")
+        if not cleaned:
+            continue
+        if cleaned.lower() in _QUERY_STOPWORDS and not any(character.isdigit() for character in cleaned):
+            continue
+        if len(cleaned) < 3 and not cleaned.isdigit():
+            continue
+        terms.append(cleaned)
+    return tuple(dict.fromkeys(terms))
+
+
 async def search_pdf_pages(memory, query: str, /, *, limit: int = 20) -> tuple[MemoryCitation, ...]:
-    """Return up to ``limit`` distinct exact page citations for one query."""
+    """Return up to ``limit`` distinct exact page citations for one query.
+
+    Retrieval fans out over the full question, its content terms, and its
+    figures, then fuses the rankings with reciprocal-rank fusion so evidence
+    pages appearing in several views surface first.
+    """
 
     from powercontext.builtin.artifacts.memory.models import MemoryCitation
-    from powercontext.builtin.runtime import GetMemoryEntryRequest, SearchMemoryRequest
+    from powercontext.builtin.runtime import SearchMemoryRequest
 
     if limit < 1:
         raise ValueError("limit must be a positive integer")  # noqa: TRY003
-    page = await memory.search(SearchMemoryRequest(query=query, mode="fts", limit=max(limit * 4, 64)))
-    citations: list[MemoryCitation] = []
-    seen_sources: set[str] = set()
-    for hit in page.hits:
-        citation = MemoryCitation(
-            memory_ref=hit.memory_ref,
-            entry_id=hit.entry_id,
-            entry_version_id=hit.entry_version_id,
-        )
-        entry = (await memory.get(GetMemoryEntryRequest(citation=citation))).entry
-        identities = tuple(reference.source_id for reference in entry.sources)
-        if not identities or any(identity in seen_sources for identity in identities):
-            continue
-        seen_sources.update(identities)
-        citations.append(citation)
-        if len(citations) == limit:
-            break
-    return tuple(citations)
+    terms = _content_terms(query)
+    figures = tuple(term for term in terms if any(character.isdigit() for character in term))
+    queries = [query]
+    keyword_query = " ".join(terms)
+    if keyword_query and keyword_query != query:
+        queries.append(keyword_query)
+    figure_query = " ".join(figures)
+    if figure_query and figure_query not in queries:
+        queries.append(figure_query)
+    scores: dict[str, float] = {}
+    citations: dict[str, MemoryCitation] = {}
+    for search_query in queries:
+        page = await memory.search(SearchMemoryRequest(query=search_query, mode="fts", limit=max(limit * 4, 64)))
+        for rank, hit in enumerate(page.hits):
+            scores[hit.entry_id] = scores.get(hit.entry_id, 0.0) + 1.0 / (60.0 + rank)
+            citations.setdefault(
+                hit.entry_id,
+                MemoryCitation(
+                    memory_ref=hit.memory_ref,
+                    entry_id=hit.entry_id,
+                    entry_version_id=hit.entry_version_id,
+                ),
+            )
+    ordered = sorted(scores, key=lambda entry_id: (-scores[entry_id], entry_id))[:limit]
+    return tuple(citations[entry_id] for entry_id in ordered)
 
 
 __all__ = [

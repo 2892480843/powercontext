@@ -100,13 +100,14 @@ LIMIT :candidate_limit
 
 
 _OCEANBASE_HYBRID_SEARCH_SQL = """
-SELECT channel, memory_artifact_id, head_revision, entry_id, entry_version_id, text FROM (
+SELECT channel, memory_artifact_id, head_revision, entry_id, entry_version_id, text, distance FROM (
   (SELECT 'fts' AS channel,
           h.memory_artifact_id AS memory_artifact_id,
           h.head_revision AS head_revision,
           h.entry_id AS entry_id,
           h.entry_version_id AS entry_version_id,
           v.text AS text,
+          NULL AS distance,
           -MATCH(h.searchable_text) AGAINST (:analyzed_query) AS sort_value
    FROM pc_memory_entry_heads AS h
    JOIN pc_memory_entry_versions AS v
@@ -114,7 +115,7 @@ SELECT channel, memory_artifact_id, head_revision, entry_id, entry_version_id, t
     AND v.memory_artifact_id = h.memory_artifact_id
     AND v.entry_version_id = h.entry_version_id
    WHERE h.scope_id = :scope_id
-     AND h.memory_artifact_id IN :memory_artifact_ids
+     AND h.memory_artifact_id IN :fts_memory_artifact_ids
      AND MATCH(h.searchable_text) AGAINST (:analyzed_query)
      /*FTS_TAGS*/
    ORDER BY MATCH(h.searchable_text) AGAINST (:analyzed_query) DESC,
@@ -127,6 +128,7 @@ SELECT channel, memory_artifact_id, head_revision, entry_id, entry_version_id, t
           m.entry_id AS entry_id,
           m.entry_version_id AS entry_version_id,
           v.text AS text,
+          l2_distance(m.embedding, :query_vector) AS distance,
           l2_distance(m.embedding, :query_vector) AS sort_value
    FROM pc_memory_vector_entries AS m
    JOIN pc_memory_entry_versions AS v
@@ -134,7 +136,7 @@ SELECT channel, memory_artifact_id, head_revision, entry_id, entry_version_id, t
     AND v.memory_artifact_id = m.memory_artifact_id
     AND v.entry_version_id = m.entry_version_id
    WHERE m.scope_id = :scope_id
-     AND m.memory_artifact_id IN :memory_artifact_ids
+     AND m.memory_artifact_id IN :vec_memory_artifact_ids
      /*VEC_TAGS*/
    ORDER BY l2_distance(m.embedding, :query_vector) APPROXIMATE
    LIMIT :candidate_limit)
@@ -276,7 +278,8 @@ class OceanBaseMemoryFTSIndex:
         else:
             sql = sql.replace("/*FTS_TAGS*/", "").replace("/*VEC_TAGS*/", "")
         statement = text(sql).bindparams(
-            bindparam("memory_artifact_ids", expanding=True),
+            bindparam("fts_memory_artifact_ids", expanding=True),
+            bindparam("vec_memory_artifact_ids", expanding=True),
             bindparam("query_vector", type_=VECTOR(request.embedding_profile.dimension)),
         )
         if request.tag_filter is not None:
@@ -284,9 +287,11 @@ class OceanBaseMemoryFTSIndex:
                 bindparam("tag_keys", expanding=True),
                 bindparam("tag_hashes", expanding=True),
             )
+        artifact_ids = tuple(memory.artifact_id for memory in request.memories)
         parameters: dict[str, Any] = {
             "scope_id": scope_id,
-            "memory_artifact_ids": tuple(memory.artifact_id for memory in request.memories),
+            "fts_memory_artifact_ids": artifact_ids,
+            "vec_memory_artifact_ids": artifact_ids,
             "analyzed_query": request.analyzed_query,
             "query_vector": tuple(request.query_vector),
             "candidate_limit": request.candidate_limit,
